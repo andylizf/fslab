@@ -1,0 +1,9 @@
+# lsp
+.cache
+compile_commands.json
+
+# objs
+vdisk
+disk.o
+fuse
+fuse~
