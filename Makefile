@@ -10,15 +10,17 @@ HANDINDIR = /home/handin-fs
 MNTDIR = mnt
 VDISK = vdisk
 
-CC = gcc
-CFLAGS = -Wall -std=gnu99
+CC = clang
+CFLAGS = -Wall -std=gnu23 -g # -fsanitize=address -fsanitize=undefined -fsanitize=leak
 
 OBJS = disk.o fs.c
 
-debug: umount clean fuse
+all: umount clean fuse
+
+debug: all
 	./fuse -s -f $(MNTDIR)
 
-mount: umount clean fuse
+mount: all
 	./fuse -s $(MNTDIR)
 
 umount:
