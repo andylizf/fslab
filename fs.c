@@ -15,6 +15,7 @@ Filesystem Lab disigned and implemented by Liang Junkai,RUC
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
@@ -23,6 +24,7 @@ Filesystem Lab disigned and implemented by Liang Junkai,RUC
 #define REGMODE (S_IFREG | 0644)
 
 #define ceil_div(a, b) (((a) + (b) - 1) / (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
 
 struct superblock {
     uint32_t block_size;
@@ -505,7 +507,45 @@ int fs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, [[maybe_u
 int fs_read(const char* path, char* buffer, size_t size, off_t offset, struct fuse_file_info* fi)
 {
     printf("Read is called:%s\n", path);
-    return 0;
+
+    int inode_pos = fi->fh;
+
+    struct inode inode;
+    if (inode_read(inode_pos, &inode)) {
+        return -1;
+    }
+
+    if (offset >= inode.size) {
+        return 0;
+    }
+
+    size = min(size, inode.size - offset);
+    int total_read = 0;
+
+    char buf[BLOCK_SIZE];
+    while (size > 0) {
+        int block_idx = (offset + total_read) / BLOCK_SIZE;
+        int block_offset = (offset + total_read) % BLOCK_SIZE;
+        int read_from_block = min(size, BLOCK_SIZE - block_offset);
+
+        if (inode.block_point[block_idx] == -1) {
+            break; // No more data blocks to read
+        }
+
+        if (data_read(inode.block_point[block_idx], buf) == -1) {
+            return -1;
+        }
+
+        memcpy(buffer + total_read, buf + block_offset, read_from_block);
+        total_read += read_from_block;
+        size -= read_from_block;
+    }
+
+    inode.atime = time(NULL);
+    if (inode_write(inode_pos, &inode)) {
+        return -1;
+    }
+    return total_read;
 }
 
 // Create a regular file or directory, depending on the `mode`
@@ -688,6 +728,33 @@ int fs_rename(const char* oldpath, const char* newpath)
     return 0;
 }
 
+int inode_truncate(struct inode* inode, off_t size)
+{
+    if (size > BLOCK_SIZE * DIRECT_BLOCK_NUM) {
+        return -ENOSPC;
+    }
+
+    inode->atime = inode->ctime = time(NULL);
+    if (inode->size < size) {
+        // allocate the data blocks
+        for (int i = ceil_div(inode->size, BLOCK_SIZE); i < ceil_div(size, BLOCK_SIZE); i++) {
+            int block_pos = alloc_block(BITMAP_BLOCK_DATA, DATA_BLOCK_SIZE);
+            if (block_pos == -1) {
+                return -ENOSPC;
+            }
+            inode->block_point[i] = block_pos;
+        }
+    } else if (inode->size > size) {
+        // release the data blocks
+        for (int i = ceil_div(size, BLOCK_SIZE); i < ceil_div(inode->size, BLOCK_SIZE); i++) {
+            clear_block(BITMAP_BLOCK_DATA, inode->block_point[i]);
+        }
+    }
+    inode->size = size;
+
+    return 0;
+}
+
 // Write data to a regular file
 // Update the `mtime` and `ctime` of the file
 // Return the number of bytes written which should be equal to `size`, or 0 on error
@@ -695,15 +762,52 @@ int fs_write(const char* path, const char* buffer, size_t size, off_t offset, st
 {
     printf("Write is called:%s\n", path);
 
-    // Adjust the size of the file first
+    int inode_pos = fi->fh;
 
-    // Write the data to the file
-    // `O_APPEND` requires special handling
-    if (fi->flags & O_CREAT) {
-        fs_mknod(path, 0, 0);
+    struct inode inode;
+    if (inode_read(inode_pos, &inode)) {
+        return -1;
     }
 
-    return 0;
+    if (fi->flags & O_APPEND) {
+        // the system should set the file offset to the end of the file when `O_APPEND` is set
+        // but we explicitly set again to prevent some unexpected behavior
+        offset = inode.size;
+    }
+
+    // Adjust the size of the file first
+    if (offset + size > inode.size) {
+        if (inode_truncate(&inode, offset + size)) {
+            return 0;
+        }
+    }
+
+    int total_written = 0;
+    char buf[BLOCK_SIZE];
+    while (size > 0) {
+        int block_idx = (offset + total_written) / BLOCK_SIZE;
+        int block_offset = (offset + total_written) % BLOCK_SIZE;
+        int write_to_block = min(size, BLOCK_SIZE - block_offset);
+
+        assert(inode.block_point[block_idx] != -1); // The block should be allocated
+        if (data_read(inode.block_point[block_idx], buf) == -1) {
+            return 0;
+        }
+        memcpy(buf + block_offset, buffer + total_written, write_to_block);
+        if (data_write(inode.block_point[block_idx], buf) == -1) {
+            return 0;
+        }
+
+        total_written += write_to_block;
+        size -= write_to_block;
+    }
+
+    inode.mtime = inode.ctime = time(NULL);
+    if (inode_write(inode_pos, &inode)) {
+        return 0;
+    }
+
+    return total_written;
 }
 
 // Change the size of a regular file
@@ -718,26 +822,8 @@ int fs_truncate(const char* path, off_t size)
     int inode_pos = resolve_path_to_inode(path, &inode);
     assert(inode.mode == REGMODE);
 
-    if (size > BLOCK_SIZE * DIRECT_BLOCK_NUM) {
+    if (inode_truncate(&inode, size)) {
         return -ENOSPC;
-    }
-
-    inode.size = size;
-    inode.atime = inode.mtime = inode.ctime = time(NULL);
-    if (inode.size < size) {
-        // allocate the data blocks
-        for (int i = ceil_div(inode.size, BLOCK_SIZE); i < ceil_div(size, BLOCK_SIZE); i++) {
-            int block_pos = alloc_block(BITMAP_BLOCK_DATA, DATA_BLOCK_SIZE);
-            if (block_pos == -1) {
-                return -ENOSPC;
-            }
-            inode.block_point[i] = block_pos;
-        }
-    } else if (inode.size > size) {
-        // release the data blocks
-        for (int i = ceil_div(size, BLOCK_SIZE); i < ceil_div(inode.size, BLOCK_SIZE); i++) {
-            clear_block(BITMAP_BLOCK_DATA, inode.block_point[i]);
-        }
     }
 
     if (inode_write(inode_pos, &inode)) {
@@ -792,6 +878,19 @@ int fs_statfs([[maybe_unused]] const char* path, struct statvfs* stat)
 int fs_open(const char* path, struct fuse_file_info* fi)
 {
     printf("Open is called:%s\n", path);
+
+    // if the file does not exist, create it
+    if (fi->flags & O_CREAT) {
+        fs_mknod(path, 0, 0);
+    }
+
+    struct inode inode;
+    int inode_pos = resolve_path_to_inode(path, &inode);
+    if (inode_pos == -1) {
+        return -ENOENT;
+    }
+
+    fi->fh = inode_pos;
     return 0;
 }
 
