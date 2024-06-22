@@ -1,1 +1,1 @@
-df -h | grep "fuse" -o
+df -h | grep -w "fuse" -o
