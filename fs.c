@@ -38,7 +38,7 @@ struct superblock {
 };
 
 #define DIRECT_BLOCK_NUM 12
-// #define SINGLE_INDIRECT_BLOCK_NUM 1
+#define SINGLE_INDIRECT_BLOCK_NUM 2
 
 struct inode {
     uint32_t mode;
@@ -47,20 +47,26 @@ struct inode {
     uint32_t mtime;
     uint32_t ctime;
     uint32_t block_point[DIRECT_BLOCK_NUM];
-    // uint32_t block_point_indirect[SINGLE_INDIRECT_BLOCK_NUM];
+    uint32_t block_point_indirect[SINGLE_INDIRECT_BLOCK_NUM];
 };
 
+#define INDIRECT_POINTERS_PER_BLOCK (BLOCK_SIZE / sizeof(uint32_t))
+
 #define INODE_SIZE 128
-#define INODE_NUM 1024
+#define INODE_NUM 32768
+#define INODE_TABLE_SIZE (INODE_NUM * INODE_SIZE / BLOCK_SIZE) // 1024
+#define DATA_BITMAP_BLOCK_NUM 16
+
 #define SUPERBLOCK_BLOCK 0
 #define BITMAP_BLOCK_INODE 1
 #define BITMAP_BLOCK_DATA 2
-#define INODE_TABLE_START 3
-#define DATA_BLOCK_START 35
-#define DATA_BLOCK_SIZE (BLOCK_NUM - DATA_BLOCK_START)
+#define INODE_TABLE_START (BITMAP_BLOCK_DATA + DATA_BITMAP_BLOCK_NUM) // 18
+#define DATA_BLOCK_START (INODE_TABLE_START + INODE_TABLE_SIZE) // 1042
+#define DATA_BLOCK_SIZE (BLOCK_NUM - DATA_BLOCK_START) // 64494
 
 #define MIN_AVAILABLE_SIZE (250 * 1024 * 1024)
-#define MIN_FILE_SIZE 32768
+#define MIN_FILE_NUM 32768
+#define MAX_FILE_SIZE 8 * 1024 * 1024
 
 #define MAX_FILENAME_LEN 25
 #define DIR_ENTRY_SIZE 32
@@ -68,6 +74,8 @@ struct inode {
 
 #define ROOT_INODE 0
 
+#define DATA_BLOCK_PER_INODE (DIRECT_BLOCK_NUM + SINGLE_INDIRECT_BLOCK_NUM * INDIRECT_POINTERS_PER_BLOCK)
+#define DIR_ENTRY_PER_INODE (DATA_BLOCK_PER_INODE * DIR_ENTRY_NUM)
 struct dir_entry {
     char name[MAX_FILENAME_LEN];
     uint32_t inode_pos;
@@ -141,6 +149,77 @@ int clear_block(int bitmap_block, int block_pos)
     return 0;
 }
 
+// Get the real block position (block pointer) corresponding to the block_id of the inode
+int get_block_pos(struct inode* inode, int id, int* block_pos)
+{
+    if (id < DIRECT_BLOCK_NUM) {
+        *block_pos = inode->block_point[id];
+        return 0;
+    } else {
+        int indirect_index = (id - DIRECT_BLOCK_NUM) / INDIRECT_POINTERS_PER_BLOCK, indirect_offset = (id - DIRECT_BLOCK_NUM) % INDIRECT_POINTERS_PER_BLOCK;
+
+        if (indirect_index >= SINGLE_INDIRECT_BLOCK_NUM) {
+            return -1; // Out of bounds
+        }
+
+        if (inode->block_point_indirect[indirect_index] == -1) {
+            *block_pos = -1;
+            return 0;
+        }
+
+        uint32_t indirect_buf[INDIRECT_POINTERS_PER_BLOCK];
+        if (disk_read(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
+            return -1;
+        }
+
+        *block_pos = indirect_buf[indirect_offset];
+        return 0;
+    }
+}
+
+// Set the real block position (block pointer) corresponding to the block_id of the inode
+int set_block_pos(struct inode* inode, int id, int block_pos)
+{
+    if (id < DIRECT_BLOCK_NUM) {
+        inode->block_point[id] = block_pos;
+        return 0;
+    } else {
+        int indirect_index = (id - DIRECT_BLOCK_NUM) / INDIRECT_POINTERS_PER_BLOCK, indirect_offset = (id - DIRECT_BLOCK_NUM) % INDIRECT_POINTERS_PER_BLOCK;
+
+        if (indirect_index >= SINGLE_INDIRECT_BLOCK_NUM) {
+            return -1; // Out of bounds
+        }
+
+        if (inode->block_point_indirect[indirect_index] == -1) {
+            if (block_pos == -1) {
+                return 0; // Nothing to do, already -1
+            }
+            int indirect_block_pos = alloc_block(BITMAP_BLOCK_DATA, DATA_BLOCK_SIZE);
+            if (indirect_block_pos == -1) {
+                return -1;
+            }
+            inode->block_point_indirect[indirect_index] = indirect_block_pos;
+            // Initialize the indirect block
+            uint32_t zero_buf[INDIRECT_POINTERS_PER_BLOCK] = { 0 };
+            if (disk_write(indirect_block_pos, (char*)zero_buf)) {
+                return -1;
+            }
+        }
+
+        uint32_t indirect_buf[INDIRECT_POINTERS_PER_BLOCK];
+        if (disk_read(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
+            return -1;
+        }
+
+        indirect_buf[indirect_offset] = block_pos;
+        if (disk_write(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
+            return -1;
+        }
+
+        return 0;
+    }
+}
+
 // Read and write the inode
 int inode_read(int inode_pos, struct inode* inode)
 {
@@ -205,138 +284,159 @@ int data_write(int block_pos, char* buf)
     return 0;
 }
 
-struct dir_entry* add_dir_entry(int dir_inode, const struct dir_entry* entry)
+struct dir_entry* add_dir_entry(struct inode* inode, const struct dir_entry* entry)
 {
-    // read the inode
-    struct inode inode;
-    if (inode_read(dir_inode, &inode)) {
-        return NULL;
-    }
-
-    // get the data blocks and find an empty entry
-    char buf[BLOCK_SIZE];
-    for (int i = 0; i < DIRECT_BLOCK_NUM; i++) { // TODO: get current block number by size
-        if (inode.block_point[i] == -1) {
-            inode.block_point[i] = alloc_block(BITMAP_BLOCK_DATA, DATA_BLOCK_SIZE);
-            if (inode_write(dir_inode, &inode)) {
+    for (int i = 0; i < DIR_ENTRY_PER_INODE; i++) {
+        int block_id = i / DIR_ENTRY_NUM, block_offset = i % DIR_ENTRY_NUM;
+        int block_pos;
+        if (get_block_pos(inode, block_id, &block_pos)) {
+            return NULL;
+        }
+        if (block_pos == -1) {
+            block_pos = alloc_block(BITMAP_BLOCK_DATA, DATA_BLOCK_SIZE);
+            if (block_pos == -1) {
+                return NULL;
+            }
+            if (set_block_pos(inode, block_id, block_pos)) {
                 return NULL;
             }
         }
-        if (data_read(inode.block_point[i], buf)) {
+        char buf[BLOCK_SIZE];
+        if (data_read(block_pos, buf)) {
             return NULL;
         }
-        for (int j = 0; j < DIR_ENTRY_NUM; j++) {
-            struct dir_entry* e = (struct dir_entry*)(buf + j * DIR_ENTRY_SIZE);
-            if (e->inode_pos == 0) {
-                memcpy(e, entry, sizeof(struct dir_entry));
-                if (data_write(inode.block_point[i], buf)) {
-                    return NULL;
-                }
-                return e;
+        struct dir_entry* dir_entry = (struct dir_entry*)(buf + block_offset * DIR_ENTRY_SIZE);
+        if (dir_entry->inode_pos == 0) {
+            *dir_entry = *entry;
+            inode->size += DIR_ENTRY_SIZE;
+            if (data_write(block_pos, buf)) {
+                return NULL;
             }
+            return dir_entry;
         }
     }
     return NULL;
 }
-struct dir_entry* find_dir_entry(int dir_inode, const char* entry_name)
-{
-    // read the inode
-    struct inode inode;
-    if (inode_read(dir_inode, &inode)) {
-        return NULL;
-    }
 
-    // get the data blocks and find the entry
-    char buf[BLOCK_SIZE];
-    for (int i = 0; i < DIRECT_BLOCK_NUM; i++) {
-        if (inode.block_point[i] == -1) {
-            continue;
-        }
-        if (data_read(inode.block_point[i], buf)) {
+struct dir_entry* find_dir_entry(struct inode* inode, const char* entry_name)
+{
+    for (int i = 0; i < DIR_ENTRY_PER_INODE; i++) {
+        int block_id = i / DIR_ENTRY_NUM, block_offset = i % DIR_ENTRY_NUM;
+        int block_pos;
+        if (get_block_pos(inode, block_id, &block_pos)) {
             return NULL;
         }
-        for (int j = 0; j < DIR_ENTRY_NUM; j++) {
-            struct dir_entry* entry = (struct dir_entry*)(buf + j * DIR_ENTRY_SIZE);
-            if (entry->inode_pos == 0) {
-                continue;
-            }
-            if (strcmp(entry->name, entry_name) == 0) {
-                return entry;
-            }
+        if (block_pos == -1) {
+            continue;
+        }
+        char buf[BLOCK_SIZE];
+        if (data_read(block_pos, buf)) {
+            return NULL;
+        }
+        struct dir_entry* entry = (struct dir_entry*)(buf + block_offset * DIR_ENTRY_SIZE);
+        if (entry->inode_pos == 0) {
+            continue;
+        }
+        if (strcmp(entry->name, entry_name) == 0) {
+            return entry;
         }
     }
     return NULL;
 }
-int remove_dir_entry(int dir_inode, const char* entry_name, struct dir_entry* old_entry)
+int remove_dir_entry(struct inode* inode, const char* entry_name, struct dir_entry* old_entry)
 {
-    // read the inode
-    struct inode inode;
-    if (inode_read(dir_inode, &inode)) {
-        return -1;
-    }
-
-    // get the data blocks and find the entry
-    char buf[BLOCK_SIZE];
-    for (int i = 0; i < DIRECT_BLOCK_NUM; i++) {
-        if (inode.block_point[i] == -1) {
-            continue;
-        }
-        if (data_read(inode.block_point[i], buf)) {
+    for (int i = 0; i < DIR_ENTRY_PER_INODE; i++) {
+        int block_id = i / DIR_ENTRY_NUM, block_offset = i % DIR_ENTRY_NUM;
+        int block_pos;
+        if (get_block_pos(inode, block_id, &block_pos)) {
             return -1;
         }
-        for (int j = 0; j < DIR_ENTRY_NUM; j++) {
-            struct dir_entry* entry = (struct dir_entry*)(buf + j * DIR_ENTRY_SIZE);
-            if (entry->inode_pos == 0) {
-                continue;
-            }
-            if (strcmp(entry->name, entry_name) == 0) {
-                if (old_entry) {
-                    *old_entry = *entry;
-                }
-                entry->inode_pos = 0;
-                if (data_write(inode.block_point[i], buf)) {
-                    return -1;
-                }
-                return 0;
-            }
-        }
-    }
-    return -1;
-}
-
-// Called every time a directory entry is visited. Return 0 to continue, nonzero to break
-typedef int (*walk_dir_entry_callback)(struct dir_entry*, void* context);
-int walk_dir_entry(int dir_inode, walk_dir_entry_callback callback, void* context)
-{
-    // read the inode
-    struct inode inode;
-    if (inode_read(dir_inode, &inode)) {
-        return -1;
-    }
-
-    // get the data blocks and find the entry
-    char buf[BLOCK_SIZE];
-    for (int i = 0; i < DIRECT_BLOCK_NUM; i++) {
-        if (inode.block_point[i] == -1) {
+        if (block_pos == -1) {
             continue;
         }
-        if (data_read(inode.block_point[i], buf)) {
+        char buf[BLOCK_SIZE];
+        if (data_read(block_pos, buf)) {
             return -1;
         }
-        for (int j = 0; j < DIR_ENTRY_NUM; j++) {
-            struct dir_entry* entry = (struct dir_entry*)(buf + j * DIR_ENTRY_SIZE);
-            if (entry->inode_pos == 0) {
-                continue;
+        struct dir_entry* entry = (struct dir_entry*)(buf + block_offset * DIR_ENTRY_SIZE);
+        if (entry->inode_pos == 0) {
+            continue;
+        }
+        if (strcmp(entry->name, entry_name) == 0) {
+            *old_entry = *entry;
+            entry->inode_pos = 0;
+            inode->size -= DIR_ENTRY_SIZE;
+            if (data_write(block_pos, buf)) {
+                return -1;
             }
-            if (callback(entry, context)) {
-                return 0;
+            return 0;
+        }
+    }
+
+    // release all unused data blocks
+    for (int block_id = 0; block_id < DATA_BLOCK_PER_INODE; block_id++) {
+        int block_pos;
+        if (get_block_pos(inode, block_id, &block_pos)) {
+            return -1;
+        }
+        if (block_pos == -1) {
+            continue;
+        }
+        char buf[BLOCK_SIZE];
+        if (data_read(block_pos, buf)) {
+            return -1;
+        }
+        bool used = false;
+        for (int i = 0; i < DIR_ENTRY_NUM; i++) {
+            struct dir_entry* entry = (struct dir_entry*)(buf + i * DIR_ENTRY_SIZE);
+            if (entry->inode_pos != 0) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) {
+            if (clear_block(BITMAP_BLOCK_DATA, block_pos)) {
+                return -1;
+            }
+            if (set_block_pos(inode, block_id, -1)) {
+                return -1;
             }
         }
     }
     return 0;
 }
 
-#define MAX_LAYER 10
+// Called every time a directory entry is visited. Return 0 to continue, nonzero to break
+typedef int (*walk_dir_entry_callback)(struct dir_entry*, void* context);
+int walk_dir_entry(struct inode* inode, walk_dir_entry_callback callback, void* context)
+{
+    // get the data blocks and find the entry
+    char buf[BLOCK_SIZE];
+    assert(inode->size % DIR_ENTRY_SIZE == 0);
+    for (int i = 0; i < DIR_ENTRY_PER_INODE; i++) {
+        int block_id = i / DIR_ENTRY_NUM, block_offset = i % DIR_ENTRY_NUM;
+        int block_pos;
+        if (get_block_pos(inode, block_id, &block_pos)) {
+            return -1;
+        }
+        if (block_pos == -1) {
+            continue;
+        }
+        if (data_read(block_pos, buf)) {
+            return -1;
+        }
+        struct dir_entry* entry = (struct dir_entry*)(buf + block_offset * DIR_ENTRY_SIZE);
+        if (entry->inode_pos == 0) {
+            continue;
+        }
+        if (callback(entry, context)) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+#define MAX_LAYER 130
 
 // Resolve the path to the inode
 // Return the inode position if the path exists, -1 otherwise
@@ -356,15 +456,17 @@ int resolve_path_to_inode(const char* path, struct inode* inode)
 
     int inode_pos = ROOT_INODE;
     while (layer_count-- > 0) {
-        struct dir_entry* entry = find_dir_entry(inode_pos, path_layer[layer_count]);
+        if (inode_read(inode_pos, inode)) {
+            return -1;
+        }
+        struct dir_entry* entry = find_dir_entry(inode, path_layer[layer_count]);
         if (entry == NULL) {
             return -1;
         }
         inode_pos = entry->inode_pos;
-        printf("inode_pos:%d\n", inode_pos);
     }
 
-    if (inode && inode_read(inode_pos, inode)) {
+    if (inode_read(inode_pos, inode)) {
         return -1;
     }
     return inode_pos;
@@ -389,7 +491,13 @@ int mkfs()
     static_assert(INODE_SIZE * INODE_NUM <= BLOCK_SIZE * (DATA_BLOCK_START - INODE_TABLE_START), "The inode table should be smaller than assigned blocks");
     static_assert(BLOCK_SIZE % INODE_SIZE == 0, "The inode should be aligned with the block size");
 
-    static_assert((BLOCK_NUM - DATA_BLOCK_START) * BLOCK_SIZE >= MIN_AVAILABLE_SIZE, "The available size should be larger than MIN_AVAILABLE_SIZE");
+    // for bitmap
+    static_assert(INODE_NUM / 8 / BLOCK_SIZE <= 1, "The inode bitmap should be smaller than one block");
+    static_assert(DATA_BLOCK_SIZE / 8 / BLOCK_SIZE <= DATA_BITMAP_BLOCK_NUM, "The data bitmap should be smaller than DATA_BITMAP_BLOCK_NUM blocks");
+
+    static_assert(DATA_BLOCK_SIZE * BLOCK_SIZE >= MIN_AVAILABLE_SIZE, "The available size should be larger than MIN_AVAILABLE_SIZE");
+    static_assert(INODE_NUM >= MIN_FILE_NUM, "The file size should be larger than MIN_FILE_NUM");
+    static_assert(DATA_BLOCK_PER_INODE * BLOCK_SIZE >= MAX_FILE_SIZE, "The file size should be larger than MAX_FILE_SIZE");
 
     static_assert(sizeof(struct dir_entry) <= DIR_ENTRY_SIZE, "The directory entry should be smaller than DIR_ENTRY_SIZE");
     static_assert(DIR_ENTRY_SIZE * DIR_ENTRY_NUM <= BLOCK_SIZE, "The directory should be smaller than BLOCK_SIZE");
@@ -416,27 +524,23 @@ int mkfs()
         return -1;
     }
 
-    int root_block_id = alloc_block(BITMAP_BLOCK_DATA, DATA_BLOCK_SIZE);
+    int root_block_id = alloc_block(BITMAP_BLOCK_INODE, DATA_BLOCK_SIZE);
     assert(root_block_id == ROOT_INODE);
 
     return 0;
 }
 
-int getattr(int inode_pos, struct stat* attr)
+int getattr(struct inode* inode, struct stat* attr)
 {
-    struct inode inode;
-    if (inode_read(inode_pos, &inode)) {
-        return 1;
-    }
     *attr = (struct stat) {
-        .st_mode = inode.mode,
+        .st_mode = inode->mode,
         .st_nlink = 1,
         .st_uid = getuid(),
         .st_gid = getgid(),
-        .st_size = inode.size,
-        .st_atime = inode.atime,
-        .st_mtime = inode.mtime,
-        .st_ctime = inode.ctime,
+        .st_size = inode->size,
+        .st_atime = inode->atime,
+        .st_mtime = inode->mtime,
+        .st_ctime = inode->ctime,
     };
     return 0;
 }
@@ -447,12 +551,13 @@ int fs_getattr(const char* path, struct stat* attr)
 {
     printf("Getattr is called:%s\n", path);
 
-    int inode_pos = resolve_path_to_inode(path, NULL);
+    struct inode inode;
+    int inode_pos = resolve_path_to_inode(path, &inode);
     if (inode_pos == -1) {
         return -ENOENT;
     }
 
-    return getattr(inode_pos, attr);
+    return getattr(&inode, attr);
 }
 
 struct fill_dir_context {
@@ -462,8 +567,12 @@ struct fill_dir_context {
 int readaddr_callback(struct dir_entry* entry, void* context)
 {
     struct fill_dir_context* ctx = (struct fill_dir_context*)context;
+    struct inode inode;
+    if (inode_read(entry->inode_pos, &inode)) {
+        return -1;
+    }
     struct stat st;
-    if (getattr(entry->inode_pos, &st)) {
+    if (getattr(&inode, &st)) {
         return -1;
     }
     ctx->filler(ctx->buf, entry->name, &st, 0);
@@ -488,7 +597,7 @@ int fs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, [[maybe_u
         .filler = filler,
         .buf = buffer,
     };
-    if (walk_dir_entry(inode_pos, readaddr_callback, &context)) {
+    if (walk_dir_entry(&inode, readaddr_callback, &context)) {
         return -1;
     }
 
@@ -527,11 +636,12 @@ int fs_read(const char* path, char* buffer, size_t size, off_t offset, struct fu
         int block_idx = (offset + total_read) / BLOCK_SIZE, block_offset = (offset + total_read) % BLOCK_SIZE;
         int read_from_block = min(size, BLOCK_SIZE - block_offset);
 
-        if (inode.block_point[block_idx] == -1) {
-            break; // No more data blocks to read
+        int block_pos;
+        if (get_block_pos(&inode, block_idx, &block_pos)) {
+            return -1;
         }
 
-        if (data_read(inode.block_point[block_idx], buf) == -1) {
+        if (data_read(block_pos, buf) == -1) {
             return -1;
         }
 
@@ -574,15 +684,6 @@ int make_file(const char* path, mode_t mode)
     }
     free(path4dir);
 
-    if (inode_read(parent_inode, &inode)) {
-        return -1;
-    }
-    inode.atime = inode.mtime = inode.ctime = time(NULL);
-    inode.size += DIR_ENTRY_SIZE;
-    if (inode_write(parent_inode, &inode)) {
-        return -1;
-    }
-
     struct dir_entry entry = {
         .inode_pos = inode_pos,
     };
@@ -592,9 +693,14 @@ int make_file(const char* path, mode_t mode)
     free(path4base);
 
     // add the directory entry
-    if (add_dir_entry(parent_inode, &entry) == NULL) {
+    if (add_dir_entry(&inode, &entry) == NULL) {
         return -1;
     }
+    inode.atime = inode.mtime = inode.ctime = time(NULL);
+    if (inode_write(parent_inode, &inode)) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -623,26 +729,25 @@ int fs_mkdir(const char* path, [[maybe_unused]] mode_t mode)
 // Return the inode position of file specified by path, or -ENOENT if the file does not exist, or -1 on error
 int remove_path_dir_entry(const char* path)
 {
+    struct inode inode;
     char* path4dir = strdup(path);
     char* dir = dirname(path4dir);
-    struct inode inode;
     int parent_inode = resolve_path_to_inode(dir, &inode);
+    free(path4dir);
     if (parent_inode == -1) {
         return -ENOENT;
     }
-    free(path4dir);
 
+    struct dir_entry entry;
     char* path4base = strdup(path);
     char* base = basename(path4base);
-    struct dir_entry entry;
-    if (remove_dir_entry(parent_inode, base, &entry)) {
+    int ret = remove_dir_entry(&inode, base, &entry);
+    free(path4base);
+    if (ret) {
         return -1;
     }
-    free(path4base);
 
-    // update the parent directory inode
     inode.atime = inode.mtime = inode.ctime = time(NULL);
-    inode.size -= DIR_ENTRY_SIZE;
     if (inode_write(parent_inode, &inode)) {
         return -1;
     }
@@ -650,16 +755,57 @@ int remove_path_dir_entry(const char* path)
     return entry.inode_pos;
 }
 
+int add_path_dir_entry(const char* path, int inode_pos)
+{
+    struct inode inode;
+    char* path4dir = strdup(path);
+    char* dir = dirname(path4dir);
+    int parent_inode = resolve_path_to_inode(dir, &inode);
+    free(path4dir);
+    if (parent_inode == -1) {
+        return -ENOENT;
+    }
+
+    struct dir_entry entry = {
+        .inode_pos = inode_pos,
+    };
+    char* path4base = strdup(path);
+    char* base = basename(path4base);
+    strncpy(entry.name, base, MAX_FILENAME_LEN);
+    int ret = add_dir_entry(&inode, &entry) == NULL;
+    free(path4base);
+    if (ret) {
+        return -1;
+    }
+
+    inode.atime = inode.mtime = inode.ctime = time(NULL);
+    if (inode_write(parent_inode, &inode)) {
+        return -1;
+    }
+
+    return 0;
+}
+
 int remove_file(const char* path)
 {
     int old_inode_pos = remove_path_dir_entry(path);
+    if (old_inode_pos < 0) {
+        return old_inode_pos;
+    }
     struct inode inode;
     if (inode_read(old_inode_pos, &inode)) {
         return -1;
     }
-    for (int i = 0; i < DIRECT_BLOCK_NUM; i++) {
-        if (inode.block_point[i] != -1) {
-            clear_block(BITMAP_BLOCK_DATA, inode.block_point[i]);
+    for (int i = 0; i < ceil_div(inode.size, BLOCK_SIZE); i++) {
+        int block_pos;
+        if (get_block_pos(&inode, i, &block_pos)) {
+            return -1;
+        }
+        if (block_pos == -1) {
+            continue;
+        }
+        if (clear_block(BITMAP_BLOCK_DATA, block_pos)) {
+            return -1;
         }
     }
     clear_block(BITMAP_BLOCK_INODE, old_inode_pos);
@@ -692,30 +838,12 @@ int fs_rename(const char* oldpath, const char* newpath)
 {
     printf("Rename is called:%s\n", newpath);
 
-    // first remove the old entry
     int inode_pos = remove_path_dir_entry(oldpath);
     if (inode_pos < 0) {
         return inode_pos;
     }
 
-    // then add the new entry
-    char* newpath4dir = strdup(newpath);
-    char* new_dir = dirname(newpath4dir);
-    int new_dir_inode = resolve_path_to_inode(new_dir, NULL);
-    if (new_dir_inode == -1) {
-        return -ENOENT;
-    }
-    free(newpath4dir);
-
-    struct dir_entry new_entry = {
-        .inode_pos = inode_pos,
-    };
-    char* newpath4base = strdup(newpath);
-    char* new_base = basename(strdup(newpath4base));
-    strncpy(new_entry.name, new_base, MAX_FILENAME_LEN);
-    free(newpath4base);
-
-    if (add_dir_entry(new_dir_inode, &new_entry) == NULL) {
+    if (add_path_dir_entry(newpath, inode_pos)) {
         return -1;
     }
     return 0;
@@ -723,24 +851,34 @@ int fs_rename(const char* oldpath, const char* newpath)
 
 int inode_truncate(struct inode* inode, off_t size)
 {
-    if (size > BLOCK_SIZE * DIRECT_BLOCK_NUM) {
-        return -ENOSPC;
-    }
+    assert(size <= MAX_FILE_SIZE);
 
     inode->atime = inode->ctime = time(NULL);
     if (inode->size < size) {
         // allocate the data blocks
-        for (int i = ceil_div(inode->size, BLOCK_SIZE); i < ceil_div(size, BLOCK_SIZE); i++) {
+        for (int i = ceil_div(inode->size + 1, BLOCK_SIZE); i <= ceil_div(size, BLOCK_SIZE); i++) {
             int block_pos = alloc_block(BITMAP_BLOCK_DATA, DATA_BLOCK_SIZE);
             if (block_pos == -1) {
                 return -ENOSPC;
             }
-            inode->block_point[i] = block_pos;
+            if (set_block_pos(inode, i, block_pos)) {
+                return -1;
+            }
         }
+
     } else if (inode->size > size) {
         // release the data blocks
-        for (int i = ceil_div(size, BLOCK_SIZE); i < ceil_div(inode->size, BLOCK_SIZE); i++) {
-            clear_block(BITMAP_BLOCK_DATA, inode->block_point[i]);
+        for (int i = ceil_div(size + 1, BLOCK_SIZE); i <= ceil_div(inode->size, BLOCK_SIZE); i++) {
+            int block_pos;
+            if (get_block_pos(inode, i, &block_pos)) {
+                return -1;
+            }
+            if (clear_block(BITMAP_BLOCK_DATA, block_pos)) {
+                return -1;
+            }
+            if (set_block_pos(inode, i, -1)) {
+                return -1;
+            }
         }
     }
     inode->size = size;
@@ -781,12 +919,16 @@ int fs_write(const char* path, const char* buffer, size_t size, off_t offset, st
         int block_idx = (offset + total_written) / BLOCK_SIZE, block_offset = (offset + total_written) % BLOCK_SIZE;
         int write_to_block = min(size, BLOCK_SIZE - block_offset);
 
-        assert(inode.block_point[block_idx] != -1); // The block should be allocated
-        if (data_read(inode.block_point[block_idx], buf) == -1) {
+        int block_pos;
+        if (get_block_pos(&inode, block_idx, &block_pos)) {
+            return 0;
+        }
+
+        if (data_read(block_pos, buf) == -1) {
             return 0;
         }
         memcpy(buf + block_offset, buffer + total_written, write_to_block);
-        if (data_write(inode.block_point[block_idx], buf) == -1) {
+        if (data_write(block_pos, buf)) {
             return 0;
         }
 
