@@ -50,7 +50,7 @@ struct inode {
     uint32_t block_point_indirect[SINGLE_INDIRECT_BLOCK_NUM];
 };
 
-#define INDIRECT_POINTERS_PER_BLOCK (BLOCK_SIZE / sizeof(uint32_t))
+#define INDIRECT_POINTERS_PER_BLOCK (BLOCK_SIZE / sizeof(uint32_t)) // 1024
 
 #define INODE_SIZE 128
 #define INODE_NUM 32768
@@ -70,12 +70,12 @@ struct inode {
 
 #define MAX_FILENAME_LEN 25
 #define DIR_ENTRY_SIZE 32
-#define DIR_ENTRY_NUM (BLOCK_SIZE / DIR_ENTRY_SIZE)
+#define DIR_ENTRY_NUM (BLOCK_SIZE / DIR_ENTRY_SIZE) // 128
 
 #define ROOT_INODE 0
 
-#define DATA_BLOCK_PER_INODE (DIRECT_BLOCK_NUM + SINGLE_INDIRECT_BLOCK_NUM * INDIRECT_POINTERS_PER_BLOCK)
-#define DIR_ENTRY_PER_INODE (DATA_BLOCK_PER_INODE * DIR_ENTRY_NUM)
+#define DATA_BLOCK_PER_INODE (DIRECT_BLOCK_NUM + SINGLE_INDIRECT_BLOCK_NUM * INDIRECT_POINTERS_PER_BLOCK) // 2060
+#define DIR_ENTRY_PER_INODE (DATA_BLOCK_PER_INODE * DIR_ENTRY_NUM) // 263680
 struct dir_entry {
     char name[MAX_FILENAME_LEN];
     uint32_t inode_pos;
@@ -107,12 +107,78 @@ int find_empty_bit(char* buf, int size)
     return -1;
 }
 
+#define CACHE_LINE_NUM 8
+struct cache_line {
+    int block_pos;
+    char buf[BLOCK_SIZE];
+} cache[CACHE_LINE_NUM];
+
+void init_cache()
+{
+    for (int i = 0; i < CACHE_LINE_NUM; i++) {
+        cache[i].block_pos = -1;
+    }
+}
+int evict_cache_line()
+{
+    // choose the minimum block position to evict
+    int idx = rand() % CACHE_LINE_NUM;
+    int block_pos = cache[idx].block_pos;
+    // write back the cache line
+    if (block_pos != -1) {
+        if (disk_write(block_pos, cache[idx].buf)) {
+            return -1;
+        }
+    }
+    return idx;
+}
+
+int cached_disk_read(int block_pos, char* buf)
+{
+#pragma unroll
+    for (int i = 0; i < CACHE_LINE_NUM; i++) {
+        if (cache[i].block_pos == block_pos) {
+            memcpy(buf, cache[i].buf, BLOCK_SIZE);
+            return 0;
+        }
+    }
+
+    if (disk_read(block_pos, buf)) {
+        return -1;
+    }
+
+    int min_idx = evict_cache_line();
+    cache[min_idx].block_pos = block_pos;
+    memcpy(cache[min_idx].buf, buf, BLOCK_SIZE);
+    return 0;
+}
+
+int cached_disk_write(int block_pos, char* buf)
+{
+#pragma unroll
+    for (int i = 0; i < CACHE_LINE_NUM; i++) {
+        if (cache[i].block_pos == block_pos) {
+            memcpy(cache[i].buf, buf, BLOCK_SIZE);
+            return 0;
+        }
+    }
+
+    if (disk_write(block_pos, buf)) {
+        return -1;
+    }
+
+    int min_idx = evict_cache_line();
+    cache[min_idx].block_pos = block_pos;
+    memcpy(cache[min_idx].buf, buf, BLOCK_SIZE);
+    return 0;
+}
+
 int bitmap_used[3];
 int alloc_block(int bitmap_block, int bitmap_size)
 {
     // read the block bitmap
     char block_bitmap[BLOCK_SIZE];
-    if (disk_read(bitmap_block, block_bitmap)) {
+    if (cached_disk_read(bitmap_block, block_bitmap)) {
         return -1;
     }
 
@@ -124,7 +190,7 @@ int alloc_block(int bitmap_block, int bitmap_size)
 
     // set the block bitmap
     set_bit(block_bitmap, block_pos);
-    if (disk_write(bitmap_block, block_bitmap)) {
+    if (cached_disk_write(bitmap_block, block_bitmap)) {
         return -1;
     }
 
@@ -135,13 +201,13 @@ int clear_block(int bitmap_block, int block_pos)
 {
     // read the block bitmap
     char block_bitmap[BLOCK_SIZE];
-    if (disk_read(bitmap_block, block_bitmap)) {
+    if (cached_disk_read(bitmap_block, block_bitmap)) {
         return -1;
     }
 
     // clear the block bitmap
     clear_bit(block_bitmap, block_pos);
-    if (disk_write(bitmap_block, block_bitmap)) {
+    if (cached_disk_write(bitmap_block, block_bitmap)) {
         return -1;
     }
 
@@ -168,7 +234,7 @@ int get_block_pos(struct inode* inode, int id, int* block_pos)
         }
 
         uint32_t indirect_buf[INDIRECT_POINTERS_PER_BLOCK];
-        if (disk_read(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
+        if (cached_disk_read(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
             return -1;
         }
 
@@ -202,18 +268,18 @@ int set_block_pos(struct inode* inode, int id, int block_pos)
             // Initialize the indirect block
             uint32_t zero_buf[INDIRECT_POINTERS_PER_BLOCK];
             memset(zero_buf, -1, sizeof(zero_buf));
-            if (disk_write(indirect_block_pos, (char*)zero_buf)) {
+            if (cached_disk_write(indirect_block_pos, (char*)zero_buf)) {
                 return -1;
             }
         }
 
         uint32_t indirect_buf[INDIRECT_POINTERS_PER_BLOCK];
-        if (disk_read(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
+        if (cached_disk_read(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
             return -1;
         }
 
         indirect_buf[indirect_offset] = block_pos;
-        if (disk_write(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
+        if (cached_disk_write(inode->block_point_indirect[indirect_index], (char*)indirect_buf)) {
             return -1;
         }
 
@@ -227,7 +293,7 @@ int inode_read(int inode_pos, struct inode* inode)
     int inode_block = inode_pos * INODE_SIZE / BLOCK_SIZE, inode_offset = inode_pos * INODE_SIZE % BLOCK_SIZE;
 
     char buf[BLOCK_SIZE];
-    if (disk_read(INODE_TABLE_START + inode_block, buf)) {
+    if (cached_disk_read(INODE_TABLE_START + inode_block, buf)) {
         return -1;
     }
 
@@ -238,11 +304,11 @@ int inode_write(int inode_pos, struct inode* inode)
 {
     int inode_block = inode_pos * INODE_SIZE / BLOCK_SIZE, inode_offset = inode_pos * INODE_SIZE % BLOCK_SIZE;
     char buf[BLOCK_SIZE];
-    if (disk_read(INODE_TABLE_START + inode_block, buf)) {
+    if (cached_disk_read(INODE_TABLE_START + inode_block, buf)) {
         return -1;
     }
     memcpy(buf + inode_offset, inode, sizeof(struct inode));
-    if (disk_write(INODE_TABLE_START + inode_block, buf)) {
+    if (cached_disk_write(INODE_TABLE_START + inode_block, buf)) {
         return -1;
     }
     return 0;
@@ -272,14 +338,14 @@ int update_inode(int inode_pos)
 // Read and write the data block
 int data_read(int block_pos, char* buf)
 {
-    if (disk_read(DATA_BLOCK_START + block_pos, buf)) {
+    if (cached_disk_read(DATA_BLOCK_START + block_pos, buf)) {
         return -1;
     }
     return 0;
 }
 int data_write(int block_pos, char* buf)
 {
-    if (disk_write(DATA_BLOCK_START + block_pos, buf)) {
+    if (cached_disk_write(DATA_BLOCK_START + block_pos, buf)) {
         return -1;
     }
     return 0;
@@ -482,7 +548,7 @@ int mkfs()
     // clear the disk
     char buf[BLOCK_SIZE] = { 0 };
     for (int i = 0; i < BLOCK_NUM; i++) {
-        if (disk_write(i, buf)) {
+        if (cached_disk_write(i, buf)) {
             return -1;
         }
     }
@@ -514,7 +580,9 @@ int mkfs()
         .inode_block = INODE_TABLE_START,
         .data_block = DATA_BLOCK_START,
     };
-    if (disk_write(SUPERBLOCK_BLOCK, &sb)) {
+    init_cache();
+
+    if (cached_disk_write(SUPERBLOCK_BLOCK, &sb)) {
         return -1;
     }
 
