@@ -140,13 +140,10 @@ int clear_block(int bitmap_block, int block_pos)
 // Read and write the inode
 int inode_read(int inode_pos, struct inode* inode)
 {
-    printf("Inode_read is called:%d\n", inode_pos);
-    int inode_block = INODE_TABLE_START + inode_pos * INODE_SIZE / BLOCK_SIZE;
-    int inode_offset = inode_pos * INODE_SIZE % BLOCK_SIZE;
-    printf("read inode_block:%d,inode_offset:%d\n", inode_block, inode_offset);
+    int inode_block = inode_pos * INODE_SIZE / BLOCK_SIZE, inode_offset = inode_pos * INODE_SIZE % BLOCK_SIZE;
 
     char buf[BLOCK_SIZE];
-    if (disk_read(inode_block, buf)) {
+    if (disk_read(INODE_TABLE_START + inode_block, buf)) {
         return -1;
     }
 
@@ -155,19 +152,25 @@ int inode_read(int inode_pos, struct inode* inode)
 }
 int inode_write(int inode_pos, struct inode* inode)
 {
-    printf("Inode_write is called:%d\n", inode_pos);
-    int inode_block = INODE_TABLE_START + inode_pos * INODE_SIZE / BLOCK_SIZE;
-    int inode_offset = inode_pos * INODE_SIZE % BLOCK_SIZE;
-    printf("write inode_block:%d,inode_offset:%d\n", inode_block, inode_offset);
+    int inode_block = inode_pos * INODE_SIZE / BLOCK_SIZE, inode_offset = inode_pos * INODE_SIZE % BLOCK_SIZE;
     char buf[BLOCK_SIZE];
-    if (disk_read(inode_block, buf)) {
+    if (disk_read(INODE_TABLE_START + inode_block, buf)) {
         return -1;
     }
     memcpy(buf + inode_offset, inode, sizeof(struct inode));
-    if (disk_write(inode_block, buf)) {
+    if (disk_write(INODE_TABLE_START + inode_block, buf)) {
         return -1;
     }
     return 0;
+}
+
+void init_inode(struct inode* inode, mode_t mode)
+{
+    inode->mode = mode;
+    inode->size = 0;
+    inode->atime = inode->mtime = inode->ctime = time(NULL);
+    memset(inode->block_point, -1, sizeof(inode->block_point));
+    memset(inode->block_point_indirect, -1, sizeof(inode->block_point_indirect));
 }
 int update_inode(int inode_pos)
 {
@@ -403,21 +406,14 @@ int mkfs()
     }
 
     // write the root directory
-    struct inode root_inode = {
-        .mode = DIRMODE,
-        .size = DIR_ENTRY_SIZE,
-        .atime = time(NULL),
-        .mtime = time(NULL),
-        .ctime = time(NULL),
-    };
-    memset(root_inode.block_point, -1, sizeof(root_inode.block_point));
+    struct inode root_inode;
+    init_inode(&root_inode, DIRMODE);
     if (inode_write(ROOT_INODE, &root_inode)) {
         return -1;
     }
-    set_bit(buf, 0);
-    if (disk_write(BITMAP_BLOCK_INODE, buf)) {
-        return -1;
-    }
+
+    int root_block_id = alloc_block(BITMAP_BLOCK_DATA, DATA_BLOCK_SIZE);
+    assert(root_block_id == ROOT_INODE);
 
     return 0;
 }
@@ -524,8 +520,7 @@ int fs_read(const char* path, char* buffer, size_t size, off_t offset, struct fu
 
     char buf[BLOCK_SIZE];
     while (size > 0) {
-        int block_idx = (offset + total_read) / BLOCK_SIZE;
-        int block_offset = (offset + total_read) % BLOCK_SIZE;
+        int block_idx = (offset + total_read) / BLOCK_SIZE, block_offset = (offset + total_read) % BLOCK_SIZE;
         int read_from_block = min(size, BLOCK_SIZE - block_offset);
 
         if (inode.block_point[block_idx] == -1) {
@@ -560,14 +555,8 @@ int make_file(const char* path, mode_t mode)
     }
 
     // write the inode
-    struct inode inode = {
-        .mode = mode,
-        .size = 0,
-        .atime = time(NULL),
-        .mtime = time(NULL),
-        .ctime = time(NULL),
-    };
-    memset(inode.block_point, -1, sizeof(inode.block_point));
+    struct inode inode;
+    init_inode(&inode, mode);
     if (inode_write(inode_pos, &inode)) {
         return -1;
     }
@@ -785,8 +774,7 @@ int fs_write(const char* path, const char* buffer, size_t size, off_t offset, st
     int total_written = 0;
     char buf[BLOCK_SIZE];
     while (size > 0) {
-        int block_idx = (offset + total_written) / BLOCK_SIZE;
-        int block_offset = (offset + total_written) % BLOCK_SIZE;
+        int block_idx = (offset + total_written) / BLOCK_SIZE, block_offset = (offset + total_written) % BLOCK_SIZE;
         int write_to_block = min(size, BLOCK_SIZE - block_offset);
 
         assert(inode.block_point[block_idx] != -1); // The block should be allocated
