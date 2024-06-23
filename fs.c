@@ -98,6 +98,8 @@ int find_empty_bit(char* buf, int size)
     }
     return -1;
 }
+
+int bitmap_used[3];
 int alloc_block(int bitmap_block, int bitmap_size)
 {
     // read the block bitmap
@@ -118,6 +120,7 @@ int alloc_block(int bitmap_block, int bitmap_size)
         return -1;
     }
 
+    bitmap_used[bitmap_block]++;
     return block_pos;
 }
 int clear_block(int bitmap_block, int block_pos)
@@ -134,6 +137,7 @@ int clear_block(int bitmap_block, int block_pos)
         return -1;
     }
 
+    bitmap_used[bitmap_block]--;
     return 0;
 }
 
@@ -847,13 +851,13 @@ int fs_statfs([[maybe_unused]] const char* path, struct statvfs* stat)
 
     // f_bfree == f_bavail, f_ffree == f_favail
     *stat = (struct statvfs) {
-        .f_bsize = 0,
-        .f_blocks = 0,
-        .f_bfree = 0,
-        .f_bavail = 0,
-        .f_files = 0,
-        .f_ffree = 0,
-        .f_favail = 0,
+        .f_bsize = BLOCK_SIZE,
+        .f_blocks = DATA_BLOCK_SIZE,
+        .f_bfree = DATA_BLOCK_SIZE - bitmap_used[BITMAP_BLOCK_DATA],
+        .f_bavail = DATA_BLOCK_SIZE - bitmap_used[BITMAP_BLOCK_DATA],
+        .f_files = INODE_NUM,
+        .f_ffree = INODE_NUM - bitmap_used[BITMAP_BLOCK_INODE],
+        .f_favail = INODE_NUM - bitmap_used[BITMAP_BLOCK_INODE],
         .f_namemax = 0,
     };
 
