@@ -200,7 +200,8 @@ int set_block_pos(struct inode* inode, int id, int block_pos)
             }
             inode->block_point_indirect[indirect_index] = indirect_block_pos;
             // Initialize the indirect block
-            uint32_t zero_buf[INDIRECT_POINTERS_PER_BLOCK] = { 0 };
+            uint32_t zero_buf[INDIRECT_POINTERS_PER_BLOCK];
+            memset(zero_buf, -1, sizeof(zero_buf));
             if (disk_write(indirect_block_pos, (char*)zero_buf)) {
                 return -1;
             }
