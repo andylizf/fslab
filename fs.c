@@ -20,6 +20,11 @@ Filesystem Lab disigned and implemented by Liang Junkai,RUC
 #include <unistd.h>
 #include <utime.h>
 
+// _Static_assert is a GNU extension equivalent to static_assert since C11
+#if defined(__GNUC__) && __STDC_VERSION__ < 201112L
+#define static_assert _Static_assert
+#endif
+
 #define DIRMODE (S_IFDIR | 0755)
 #define REGMODE (S_IFREG | 0644)
 
@@ -582,7 +587,7 @@ int mkfs()
     };
     init_cache();
 
-    if (cached_disk_write(SUPERBLOCK_BLOCK, &sb)) {
+    if (cached_disk_write(SUPERBLOCK_BLOCK, (char*)&sb)) {
         return -1;
     }
 
